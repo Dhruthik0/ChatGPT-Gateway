@@ -1,0 +1,14 @@
+[Unit]
+Description=Local AI Bridge
+After=ai-bridge-chrome.service
+Wants=ai-bridge-chrome.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Desktop/my_proj/free_chatGpt_Api
+ExecStart=%h/Desktop/my_proj/free_chatGpt_Api/.venv/bin/python -m ai_bridge
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=Chrome profile for the local AI bridge
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/Desktop/my_proj/free_chatGpt_Api/bin/start-chrome.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
