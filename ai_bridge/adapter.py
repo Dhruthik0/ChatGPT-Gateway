@@ -6,6 +6,7 @@ from pathlib import Path
 from playwright.async_api import Error as PWError, Page
 
 from . import selectors as S
+from . import stream
 from .browser import BrowserManager
 from .errors import BridgeError
 
@@ -77,18 +78,50 @@ class ChatGPTAdapter:
         await self._assert_ready(page)
         before = await page.locator(S.ASSISTANT_TURN).count()
 
-        t0 = time.monotonic()
-        await self._submit(page, prompt)
-        await self._wait_started(page, before, deadline)
-        log.info("adapter.generation_started after_ms=%d", (time.monotonic() - t0) * 1000)
+        # Capture the SSE alongside the DOM. The DOM still drives completion
+        # detection (proven reliable); the stream is only a better source of
+        # text, since the rendered page has already lost code-fence languages.
+        bodies: list[str] = []
+        tasks: list[asyncio.Task] = []
 
-        t1 = time.monotonic()
-        await self._wait_finished(page, deadline)
-        text = await self._wait_stable(page, deadline)
+        def on_response(resp):
+            if stream.is_stream(resp):
+                tasks.append(asyncio.create_task(self._read_stream(resp, bodies)))
 
-        log.info("adapter.generation_complete stream_ms=%d chars=%d source=dom",
-                 (time.monotonic() - t1) * 1000, len(text))
+        page.on("response", on_response)
+        try:
+            t0 = time.monotonic()
+            await self._submit(page, prompt)
+            await self._wait_started(page, before, deadline)
+            log.info("adapter.generation_started after_ms=%d", (time.monotonic() - t0) * 1000)
+
+            t1 = time.monotonic()
+            await self._wait_finished(page, deadline)
+            text = await self._wait_stable(page, deadline)
+        finally:
+            page.remove_listener("response", on_response)
+
+        source = "dom"
+        if tasks:
+            _, pending = await asyncio.wait(tasks, timeout=5)
+            for task in pending:
+                task.cancel()
+        for body in reversed(bodies):
+            parsed = stream.parse(body)
+            if parsed:
+                text, source = parsed, "stream"
+                break
+
+        log.info("adapter.generation_complete stream_ms=%d chars=%d source=%s",
+                 (time.monotonic() - t1) * 1000, len(text), source)
         return text
+
+    @staticmethod
+    async def _read_stream(resp, out: list[str]) -> None:
+        try:
+            out.append(await resp.text())
+        except PWError:
+            pass            # the DOM path still has us covered
 
     # ---------- state machine ----------
 
