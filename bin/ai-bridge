@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""CLI client. Stdlib only -- zero install cost, works outside the venv."""
+import argparse
+import json
+import os
+import sys
+import tomllib
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "ai-bridge/config.toml"
+
+
+def load_conf():
+    if not CONFIG.exists():
+        sys.exit(f"no config at {CONFIG}; start the service once to generate it")
+    c = tomllib.loads(CONFIG.read_text())
+    return f"http://{c['server']['host']}:{c['server']['port']}", c["server"]["token"]
+
+
+def call(path, payload=None, method="GET"):
+    base, token = load_conf()
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(base + path, data=data, method=method,
+                                 headers={"Authorization": f"Bearer {token}",
+                                          "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=900) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        return json.load(e)
+    except urllib.error.URLError as e:
+        sys.exit(f"ai-bridge: service unreachable at {base} ({e.reason})")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="ai-bridge")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    a = sub.add_parser("ask")
+    a.add_argument("-i", "--instruction", required=True)
+    a.add_argument("--input", help="input text; omit to read stdin when piped")
+    a.add_argument("--input-file", type=Path)
+    a.add_argument("--timeout", type=int)
+    a.add_argument("--continue", dest="cont", action="store_true", help="reuse the current conversation")
+
+    sub.add_parser("health")
+    sub.add_parser("dom")
+
+    args = ap.parse_args()
+
+    if args.cmd == "health":
+        print(json.dumps(call("/health"), indent=2))
+        return
+    if args.cmd == "dom":
+        print(json.dumps(call("/health/dom"), indent=2))
+        return
+
+    text = args.input
+    if args.input_file:
+        text = args.input_file.read_text()
+    elif text is None and not sys.stdin.isatty():
+        text = sys.stdin.read()
+
+    body = {"instruction": args.instruction, "input": text, "new_chat": not args.cont}
+    if args.timeout:
+        body["timeout"] = args.timeout
+
+    print("thinking...", file=sys.stderr, end="", flush=True)
+    res = call("/ask", body, "POST")
+    print("\r           \r", file=sys.stderr, end="", flush=True)
+
+    if res.get("success"):
+        print(res["response"])            # stdout carries only the answer, so this pipes
+    else:
+        err = res.get("error", {})
+        msg = f"ai-bridge: {err.get('code', 'ERROR')}: {err.get('message', res)}"
+        if err.get("hint"):
+            msg += f"\n  hint: {err['hint']}"
+        sys.exit(msg)
+
+
+if __name__ == "__main__":
+    main()
