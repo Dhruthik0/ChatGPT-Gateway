@@ -53,8 +53,18 @@ def test_cancel_queued_job(client, adapter):
     adapter.delay = 5
     first = client.post("/ask?async=1", json={"instruction": "slow"}).json()["job_id"]
     second = client.post("/ask?async=1", json={"instruction": "queued"}).json()["job_id"]
-    assert client.delete(f"/jobs/{second}").json()["status"] in ("cancelled", "running", "done")
+    assert client.delete(f"/jobs/{second}").json()["status"] == "cancelled"
     client.delete(f"/jobs/{first}")
+
+
+def test_cancelling_a_running_job_reports_the_real_outcome(client, adapter):
+    """DELETE used to answer "running" -- the status the caller already had."""
+    adapter.delay = 5
+    job = client.post("/ask?async=1", json={"instruction": "slow"}).json()["job_id"]
+    body = client.delete(f"/jobs/{job}").json()
+    assert body["status"] == "cancelled", body
+    assert adapter.stopped == 1
+    assert client.get(f"/jobs/{job}").json()["error"]["code"] == "REQUEST_CANCELLED"
 
 
 def test_health_needs_no_token(client):

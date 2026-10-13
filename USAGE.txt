@@ -1,0 +1,187 @@
+===============================================================================
+ AI BRIDGE - HOW TO USE IT
+ Plain-text procedure. Read with:  cat USAGE.txt
+===============================================================================
+
+WHAT IT IS
+-----------
+A service on your own machine that sends text to your logged-in ChatGPT web
+session and hands the answer back to whatever asked for it. No copy-pasting
+into the browser.
+
+     you / any program
+            |
+            v
+     localhost:8756  ---->  Chrome (your ChatGPT login)  ---->  ChatGPT
+            ^                                                      |
+            +------------------- the answer -----------------------+
+
+
+===============================================================================
+ 1. ONE-TIME SETUP   (already done - here for a rebuild or a new machine)
+===============================================================================
+
+   sudo apt install python3.12-venv
+   cd ~/Desktop/my_proj/free_chatGpt_Api
+   python3 -m venv .venv
+   .venv/bin/pip install -r requirements.txt
+   bin/start-chrome.sh          <- a Chrome window opens; LOG INTO CHATGPT IN IT
+
+That Chrome window is a separate profile from your everyday browser. You log in
+there once. The login is kept on disk and survives reboots, crashes and
+restarts - you should not need to log in again unless the session expires.
+
+Aliases were added to ~/.zshrc (backup at ~/.zshrc.bak-ai-bridge).
+
+
+===============================================================================
+ 2. DAILY FLOW
+===============================================================================
+
+   ai-up                        start it (takes ~3 seconds)
+   ai "..."                     use it
+   ai-down                      stop it when done (frees ~1.7 GB of RAM)
+
+That is the whole routine. It is NOT set to start automatically, deliberately:
+it runs a second Chrome, and your machine is memory-tight.
+
+
+===============================================================================
+ 3. ASKING THINGS
+===============================================================================
+
+Two parts to every request: the INSTRUCTION (what to do) and the INPUT (what to
+do it to). The input is optional.
+
+   ai "What is the capital of France?"
+
+   ai "Explain this simply" --input 'function add(a,b){return a+b}'
+
+   ai "Find the bug" --input-file main.py
+
+   cat main.py | ai "Find the bug"            <- input can be piped in
+
+   ai "Now in one sentence" --continue        <- stay in the same conversation
+                                                 (without it, each ask is fresh)
+
+   ai "Summarise this" --input-file long.txt --timeout 300    <- for slow answers
+
+Only the answer is printed, so it chains with other commands:
+
+   cat notes.txt | ai "Summarise as bullets" > summary.md
+   git diff | ai "Write a commit message" | git commit -F -
+
+Each conversation is a ChatGPT "temporary chat" - it does NOT appear in your
+ChatGPT history and is not used for training.
+
+
+===============================================================================
+ 4. USING IT FROM YOUR OWN PROGRAMS
+===============================================================================
+
+Any language that can make an HTTP request. The token is your key:
+
+   TOKEN=$(grep '^token' ~/.config/ai-bridge/config.toml | cut -d'"' -f2)
+
+   curl -s localhost:8756/ask \
+     -H "Authorization: Bearer $TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '{"instruction":"Translate to French","input":"good morning"}'
+
+Reply:
+
+   {"success": true, "response": "Bonjour", "job_id": "j_...",
+    "duration_ms": 7900, "source": "stream"}
+
+On failure you always get a code you can branch on:
+
+   {"success": false,
+    "error": {"code": "CHATGPT_NOT_AUTHENTICATED",
+              "message": "...", "hint": "..."}}
+
+Endpoints:
+
+   POST /ask              ask and wait for the answer
+   POST /ask?async=1      returns {job_id} straight away
+   GET  /jobs/<id>        check on an async job
+   DELETE /jobs/<id>      cancel one
+   GET  /health           is everything up and logged in?
+   GET  /health/dom       have ChatGPT's page selectors moved?
+
+The service listens on 127.0.0.1 only and requires the token, so nothing
+outside this machine can reach it.
+
+
+===============================================================================
+ 5. WHEN SOMETHING GOES WRONG  -  DO THIS FIRST
+===============================================================================
+
+   ai-check
+
+Runs 11 checks end to end in about 25 seconds and tells you exactly what is
+broken. Then match the result below:
+
+   "ChatGPT session authenticated" FAILED
+        -> your login expired. Run ai-up, then log into ChatGPT in the
+           Chrome window that opens.
+
+   "no Cloudflare challenge pending" FAILED
+        -> ChatGPT wants to check you are human. Click the checkbox yourself
+           in the Chrome window. This is expected occasionally and is not a
+           bug; the service will not try to bypass it.
+
+   "page selectors intact" FAILED
+        -> ChatGPT redesigned their website. Needs a small code fix in
+           ai_bridge/selectors.py. Not something that will fix itself.
+
+   "browser reachable on CDP" FAILED
+        -> Chrome is not running (or was killed when memory ran low).
+           Run ai-up.
+
+   "answer came from the SSE stream" FAILED
+        -> Still working, but falling back to reading the page instead of
+           ChatGPT's data stream. Answers stay correct; code blocks lose
+           their language tag. Needs a fix in ai_bridge/stream.py.
+
+   Everything passes but it still feels wrong
+        -> tail -f ~/.cache/ai-bridge/bridge.log   while you make a request.
+
+Nothing is ever lost by restarting:   ai-down && ai-up
+
+
+===============================================================================
+ 6. COMMAND REFERENCE
+===============================================================================
+
+   ai "instruction" [--input TEXT | --input-file FILE] [--continue] [--timeout N]
+   ai-up                start Chrome + service
+   ai-down              stop both, free the RAM
+   ai-status            what is running right now
+   ai-check             full end-to-end test, 11 checks
+
+   Logs:      ~/.cache/ai-bridge/bridge.log
+              ~/.cache/ai-bridge/chrome.log
+   Config:    ~/.config/ai-bridge/config.toml      (port + API token)
+   Login:     ~/.local/share/ai-bridge/chrome-profile/   (keep private)
+
+
+===============================================================================
+ 7. THINGS TO KNOW
+===============================================================================
+
+ * One request at a time. A second request waits for the first. Each takes
+   roughly 8-10 seconds.
+
+ * Automating ChatGPT's website is against OpenAI's terms of use. Personal
+   scale, your own account, your own risk.
+
+ * ChatGPT changes their website regularly. When it eventually breaks, ai-check
+   tells you which part. The ChatGPT-specific code is confined to four files:
+   ai_bridge/selectors.py, adapter.py, extract.js, stream.py
+
+ * If ChatGPT ever starts blocking this properly, the fallback is to point the
+   same "ai" command at the paid OpenAI API instead. Nothing you build on top
+   of it would need to change.
+
+ * Full technical detail: README.md and IMPLEMENTATION_PLAN.md
+===============================================================================

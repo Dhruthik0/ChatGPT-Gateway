@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import secrets
 import time
@@ -7,6 +8,8 @@ from dataclasses import dataclass, field
 from .errors import BridgeError
 
 log = logging.getLogger("ai_bridge.jobs")
+
+CANCEL_GRACE = 10       # s to let a running job unwind before DELETE answers anyway
 
 
 @dataclass
@@ -17,6 +20,7 @@ class Job:
     new_chat: bool
     status: str = "queued"          # queued | running | done | failed | cancelled
     result: str | None = None
+    source: str | None = None       # "stream" or "dom" -- which extractor answered
     error: BridgeError | None = None
     created: float = field(default_factory=time.monotonic)
     finished: float | None = None
@@ -30,7 +34,7 @@ class Job:
     def public(self) -> dict:
         out = {"job_id": self.id, "status": self.status, "duration_ms": self.duration_ms}
         if self.status == "done":
-            out |= {"success": True, "response": self.result}
+            out |= {"success": True, "response": self.result, "source": self.source}
         elif self.error:
             out |= self.error.payload()
         return out
@@ -76,12 +80,17 @@ class JobManager:
         return self.jobs.get(job_id)
 
     async def cancel(self, job: Job) -> None:
+        """Returns once the job has actually left `running`, so DELETE can answer
+        with the real outcome instead of the status the caller already knew."""
         if job.status in ("done", "failed", "cancelled"):
             return
         if job.status == "running":
             await self.adapter.stop()
             if job._task:
                 job._task.cancel()
+            # the worker owns the transition; it sets `done` in its finally
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(job.done.wait(), timeout=CANCEL_GRACE)
             return
         job.status = "cancelled"
         job.error = BridgeError("REQUEST_CANCELLED")
@@ -103,6 +112,7 @@ class JobManager:
             job._task = task
             try:
                 job.result = await task
+                job.source = getattr(self.adapter, "last_source", None)
                 job.status = "done"
             except asyncio.CancelledError:
                 if not task.cancelled():

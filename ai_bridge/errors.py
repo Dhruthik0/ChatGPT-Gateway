@@ -8,7 +8,7 @@ _ERRORS = {
     "CHATGPT_NOT_AUTHENTICATED": (401, "The ChatGPT session requires authentication.", "Log in manually in the ai-bridge Chrome window."),
     "CHATGPT_CHALLENGE_REQUIRED": (503, "Cloudflare is showing a human-verification challenge.", "Solve it once in the ai-bridge Chrome window."),
     "CHATGPT_PAGE_LOAD_FAILED": (503, "The ChatGPT page failed to load.", None),
-    "CHATGPT_RATE_LIMITED": (429, "The ChatGPT account has hit its message limit.", None),
+    "CHATGPT_RATE_LIMITED": (429, "ChatGPT is rate limiting this account.", "A message cap, or the 'Too many requests' throttle. Wait a few minutes; retrying now makes it worse."),
     "PROMPT_SUBMIT_FAILED": (502, "The prompt could not be submitted.", None),
     "GENERATION_TIMEOUT": (504, "ChatGPT did not finish generating in time.", "Raise `timeout` in the request."),
     "RESPONSE_EXTRACT_FAILED": (502, "Generation finished but no response could be extracted.", None),

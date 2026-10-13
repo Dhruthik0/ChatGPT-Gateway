@@ -81,7 +81,8 @@ def create_app(adapter=None, config=None) -> FastAPI:
         await job.done.wait()
         if job.error:
             raise job.error
-        return {"success": True, "response": job.result, "job_id": job.id, "duration_ms": job.duration_ms}
+        return {"success": True, "response": job.result, "job_id": job.id,
+                "duration_ms": job.duration_ms, "source": job.source}
 
     @app.get("/jobs/{job_id}", dependencies=[Depends(require_auth)])
     async def get_job(job_id: str):

@@ -50,12 +50,17 @@ class BrowserManager:
         log.info("browser.attached cdp=%s chrome=%s", self.cdp_url, self._browser.version)
 
     async def page(self) -> Page:
-        """The ChatGPT tab, reconnecting and reopening as needed."""
+        """The ChatGPT tab, reconnecting, re-steering and reopening as needed."""
         async with self._lock:
             if not self.connected:
                 self._page = None
                 await self._connect()
-            if self._page is not None and not self._page.is_closed():
+            # A failed goto parks the tab on chrome-error://, and it stays there.
+            # Re-checking the URL here is what stops every caller downstream --
+            # health, dom_probe, ask -- from misreading a parked tab as "logged
+            # out" or "they shipped a redesign".
+            if (self._page is not None and not self._page.is_closed()
+                    and self._page.url.startswith(S.TAB_URL_PREFIXES)):
                 return self._page
             self._page = await self._find_or_open()
             return self._page
@@ -69,9 +74,12 @@ class BrowserManager:
                         log.info("browser.tab_found url=%s", pg.url.split("?")[0])
                         return pg
             ctx = contexts[0] if contexts else await self._browser.new_context()
-            pg = await ctx.new_page()
+            # steer the parked tab back rather than opening one -- a new tab per
+            # failed navigation leaks a dead tab into the window every time
+            parked = self._page is not None and not self._page.is_closed()
+            pg = self._page if parked else await ctx.new_page()
             await pg.goto(S.BASE_URL, wait_until="domcontentloaded", timeout=45000)
-            log.info("browser.tab_opened")
+            log.info("browser.tab_%s", "resteered" if parked else "opened")
             return pg
         except BridgeError:
             raise

@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Bring the bridge up or down. Both halves (Chrome + service) in one command.
+#
+#   ai-bridge-ctl start | stop | status
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PORT=8756
+CDP=9333
+LOGDIR="$HOME/.cache/ai-bridge"
+mkdir -p "$LOGDIR"
+
+cdp_up()    { curl -s --max-time 2 "http://127.0.0.1:$CDP/json/version" >/dev/null 2>&1; }
+bridge_up() { curl -s --max-time 2 "http://127.0.0.1:$PORT/health"      >/dev/null 2>&1; }
+health()    { curl -s --max-time 3 "http://127.0.0.1:$PORT/health"; }
+
+# match only real python/chrome processes, never the shell that is asking
+pids_bridge() {
+  for p in $(pgrep -f "python -m ai_bridge" 2>/dev/null); do
+    [ "$(cat /proc/$p/comm 2>/dev/null)" = "python" ] && echo "$p"
+  done
+}
+pids_chrome() { pgrep -f "user-data-dir=$HOME/.local/share/ai-bridge/chrome-profile" 2>/dev/null; }
+
+wait_for() {  # wait_for <fn> <seconds>
+  for _ in $(seq 1 "$2"); do "$1" && return 0; printf '.'; sleep 1; done
+  return 1
+}
+
+start() {
+  if cdp_up; then
+    echo "chrome   already running"
+  else
+    printf 'chrome   starting'
+    nohup "$ROOT/bin/start-chrome.sh" >"$LOGDIR/chrome.log" 2>&1 &
+    if wait_for cdp_up 30; then echo ' ok'; else
+      echo " FAILED -- see $LOGDIR/chrome.log"; exit 1
+    fi
+  fi
+
+  if bridge_up; then
+    echo "service  already running"
+  else
+    printf 'service  starting'
+    nohup "$ROOT/.venv/bin/python" -m ai_bridge >"$LOGDIR/bridge.log" 2>&1 &
+    if wait_for bridge_up 20; then echo ' ok'; else
+      echo " FAILED -- see $LOGDIR/bridge.log"; exit 1
+    fi
+  fi
+
+  if health | grep -q '"authenticated":true'; then
+    echo "chatgpt  logged in -- ready"
+  else
+    echo "chatgpt  NOT logged in -- log into ChatGPT in the Chrome window that just opened"
+    exit 1
+  fi
+}
+
+stop() {
+  local n=0
+  for p in $(pids_bridge); do kill "$p" 2>/dev/null && n=$((n+1)); done
+  echo "service  stopped ($n process)"
+  local mb
+  mb=$(ps -o rss= -p "$(pids_chrome | tr '\n' ',' | sed 's/,$//')" 2>/dev/null | awk '{s+=$1} END {print int(s/1024)}')
+  for p in $(pids_chrome); do kill "$p" 2>/dev/null; done
+  echo "chrome   stopped (~${mb:-0} MB freed)"
+}
+
+status() {
+  cdp_up    && echo "chrome   up" || echo "chrome   down"
+  if bridge_up; then
+    echo "service  up"
+    echo "health   $(health)"
+  else
+    echo "service  down"
+  fi
+}
+
+case "${1:-status}" in
+  start|up)    start ;;
+  stop|down)   stop ;;
+  status)      status ;;
+  *) echo "usage: $(basename "$0") {start|stop|status}" >&2; exit 2 ;;
+esac

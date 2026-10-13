@@ -22,6 +22,7 @@ class FakeAdapter:
         self.delay = 0
         self.calls = []
         self.stopped = 0
+        self.last_source = "stream"
 
     async def ask(self, prompt, timeout, new_chat=True):
         self.calls.append((prompt, timeout, new_chat))

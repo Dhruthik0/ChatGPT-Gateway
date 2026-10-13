@@ -1,0 +1,8 @@
+[Unit]
+Description=ai-bridge health canary
+After=ai-bridge.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Desktop/my_proj/free_chatGpt_Api
+ExecStart=/bin/sh -c '%h/Desktop/my_proj/free_chatGpt_Api/bin/ai-bridge-check || { command -v notify-send >/dev/null && notify-send -u critical "ai-bridge check failed" "Run bin/ai-bridge-check for details"; exit 1; }'

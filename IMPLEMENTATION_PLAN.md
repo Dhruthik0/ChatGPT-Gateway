@@ -72,6 +72,35 @@ You log into ChatGPT in that window once. Cookies persist in that directory acro
 restarts. This is also better hygiene — the automation never touches your main
 profile.
 
+**Application-layer throttling is the limit you will actually hit, not Cloudflare
+(observed 2026-09-16).** Cloudflare stayed quiet across a long adversarial test
+session — zero challenges, exactly as §1.1 predicted. What *did* fire was ChatGPT's
+own app-level throttle:
+
+> **Too many requests** — You're making requests too quickly. We've temporarily
+> limited access to your conversations to protect your data.
+
+The trigger is the **shape** of the traffic, not just the count: dozens of
+near-identical very short prompts ("Reply with exactly the word: ok"), each opening a
+fresh temporary chat, fired back to back with no human pacing. That is a bot
+signature regardless of how good the browser fingerprint is — §1.1's attach-over-CDP
+strategy buys you nothing here, because nothing is being fingerprinted.
+
+It bites harder than it looks, because the modal **overlays the composer** and
+swallows the click, so it breaks §1.2's injection rather than §1.3's completion
+detection. That is why `_submit` asks the page what happened before blaming the
+composer. The recovery is a few minutes of quiet; retrying escalates it, which is
+why `CHATGPT_RATE_LIMITED` is deliberately absent from `RETRY_ON`.
+
+Consequences for this repo:
+
+- `bin/ai-bridge-check` makes **two** real ChatGPT round trips, not three — the
+  SSE-source check reuses the first answer instead of asking again. A canary that
+  provokes the failure it watches for is worse than useless.
+- Real use (a prompt here and there, with substance) is nowhere near this. The
+  throttle is a testing hazard, not a usage limit.
+- If you need to hammer it, pace it and vary the prompts.
+
 ### 1.2 Prompt injection into the composer — **LOW RISK, one gotcha**
 
 The composer is a **ProseMirror contenteditable** (`#prompt-textarea`), not a
@@ -514,7 +543,7 @@ explanation and nothing else; `pytest` is green without a browser.*
 *Done when: reboot, log in, and `curl localhost:8756/health` reports
 `authenticated: true` with no manual steps.*
 
-### Phase 5 — Hardening (4h) — partially done
+### Phase 5 — Hardening (4h) — **done**
 
 - [x] **SSE interception** (§1.3B) — done 2026-09-11, ahead of schedule, because the
   defect it fixes showed up on day one: ChatGPT's DOM no longer carries code-fence
@@ -526,14 +555,56 @@ explanation and nothing else; `pytest` is green without a browser.*
   Completion detection deliberately stays DOM-driven -- it has proven reliable and
   swapping it buys nothing today.
 
-Still open:
-- Rate-limit detection → `CHATGPT_RATE_LIMITED` with the reset time if the page
-  shows one.
-- Failure screenshots (§9).
-- One retry on `PROMPT_SUBMIT_FAILED` / `CHATGPT_DOM_CHANGED` after a page reload —
-  a surprising share of failures are a stale page.
-- A weekly `systemd` timer running `/health/dom` and desktop-notifying on drift, so
-  you learn about a redesign before a caller does.
+- [x] **Rate-limit detection** — `RATE_LIMIT_MARKER` is checked when generation
+  never starts, and raises `CHATGPT_RATE_LIMITED` (429). No reset time: ChatGPT
+  does not always show one, and a wrong one is worse than none.
+- [x] **Failure screenshots** (§9) — every `BridgeError` out of `ask()` drops a PNG
+  in `~/.cache/ai-bridge/failures/`, named `<timestamp>-<CODE>-try<n>.png`, last 20
+  kept. Best-effort: a screenshot failure never masks the real error.
+- [x] **One retry after a reload** on `PROMPT_SUBMIT_FAILED` / `CHATGPT_DOM_CHANGED`.
+  Attempt 2 forces a fresh temporary chat, which is both the reload and the guard
+  against a half-landed prompt being submitted twice into one thread. Not retried
+  past the caller's deadline, and never for codes a reload cannot fix.
+- [x] **Weekly drift canary** — `bin/ai-bridge-check` runs 11 checks against the
+  *running* deployment (CDP up, session valid, selectors present, auth/host/size
+  rejections, a real round trip, `source=stream`, an async job) and exits non-zero.
+  `systemd/ai-bridge-check.timer` runs it weekly and `notify-send`s on failure.
+
+  Its first run earned its keep: it reported `send_button` drift on a page that was
+  merely still hydrating. `_visible()` was a zero-wait snapshot, so `dom_probe` raced
+  the render and called it a redesign — a canary that cries wolf weekly gets muted,
+  which is the same as not having one. `_visible()` now takes an optional timeout and
+  the probe passes `PROBE_TIMEOUT`; the hot polling loops keep the snapshot.
+
+**Phase 5 is complete. The project is done unless Phase 6 or 7 acquires a real
+reason to exist.**
+
+#### What a full adversarial retest turned up (2026-09-16)
+
+Four defects, all found by running the thing rather than reading it:
+
+1. **The canary cried wolf.** `_visible()` was a zero-wait snapshot, so `dom_probe`
+   raced page hydration and reported a redesign. Fixed with an optional timeout.
+2. **A parked tab poisoned everything.** One failed `goto` left the tab on
+   `chrome-error://` permanently: `BrowserManager.page()` cached it and never
+   re-checked the URL, so `health` said "logged out", `dom_probe` said "redesign" and
+   only `ask` recovered. Fixed once in `page()`, which every caller routes through.
+3. **`DELETE /jobs/{id}` lied.** Cancelling a *running* job returned `status:
+   "running"` — the worker flipped it to `cancelled` moments later. `cancel()` now
+   waits for the transition it asked for (bounded by `CANCEL_GRACE`).
+4. **A throttle was misdiagnosed.** ChatGPT's "Too many requests" modal overlays the
+   composer, so the send click fails and it surfaced as `PROMPT_SUBMIT_FAILED` — a
+   code that is *retried*, hammering the service that just asked us to slow down.
+   `_submit` now asks the page what happened and raises `CHATGPT_RATE_LIMITED`.
+
+Both screenshots and the retry earned their place in the same session: #4 was
+diagnosed by opening `~/.cache/ai-bridge/failures/*.png` and reading the modal.
+
+Still open, observed once under throttling and not reproducible since: an answer came
+back with `source=dom` when the stream should have won. The DOM fallback returned the
+correct text, so this cost nothing but a canary failure. Worth watching, not worth
+speculating about — if it recurs off-throttle, `_read_stream` swallows its errors
+silently and that is the first thing to instrument.
 
 ### Phase 6 — Second client (optional)
 

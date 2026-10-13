@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -14,17 +15,40 @@ log = logging.getLogger("ai_bridge.adapter")
 
 _EXTRACT_JS = (Path(__file__).parent / "extract.js").read_text()
 
+FAILURE_DIR = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "ai-bridge/failures"
+FAILURE_KEEP = 20
+# a stale page is a surprising share of these two -- worth one reload and a retry
+RETRY_ON = ("PROMPT_SUBMIT_FAILED", "CHATGPT_DOM_CHANGED")
+PROBE_TIMEOUT = 8000  # ms; the canary must outwait a hydrating page, not cry drift
+
 POLL = 0.15          # s between state polls
 STABLE_READS = 3     # identical extractions required after the stop button vanishes
 STABLE_GAP = 0.25    # s between stability reads  -> ~750ms settle
 
 
-async def _visible(page: Page, selector: str) -> bool:
+async def _visible(page: Page, selector: str, timeout: float = 0) -> bool:
+    """Snapshot by default. timeout (ms) waits, for probes that race page render."""
     try:
         loc = page.locator(selector).first
+        if timeout:
+            await loc.wait_for(state="visible", timeout=timeout)
+            return True
         return await loc.count() > 0 and await loc.is_visible()
     except PWError:
         return False
+
+
+async def _write_shot(page: Page, tag: str) -> None:
+    """One image usually identifies a redesign instantly (plan 9). Never raises."""
+    try:
+        FAILURE_DIR.mkdir(parents=True, exist_ok=True)
+        path = FAILURE_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{tag}.png"
+        await page.screenshot(path=str(path), timeout=5000)
+        for old in sorted(FAILURE_DIR.glob("*.png"))[:-FAILURE_KEEP]:
+            old.unlink(missing_ok=True)
+        log.info("adapter.failure_shot path=%s", path)
+    except Exception:
+        log.debug("adapter.failure_shot failed", exc_info=True)
 
 
 class ChatGPTAdapter:
@@ -36,6 +60,9 @@ class ChatGPTAdapter:
 
     def __init__(self, browser: BrowserManager):
         self.browser = browser
+        # which extraction path the last ask() used: "stream" or "dom".
+        # ponytail: plain attribute, safe because exactly one worker runs asks.
+        self.last_source: str | None = None
 
     # ---------- public ----------
 
@@ -54,9 +81,13 @@ class ChatGPTAdapter:
         return report
 
     async def dom_probe(self) -> dict:
-        """The canary. Tells you they shipped a redesign before a caller finds out."""
+        """The canary. Tells you they shipped a redesign before a caller finds out.
+
+        Each selector gets a wait: a freshly opened tab renders the composer and
+        the send button a beat apart, and a zero-wait snapshot calls that drift.
+        """
         page = await self.browser.page()
-        return {name: await _visible(page, sel) for name, sel in S.REQUIRED.items()}
+        return {name: await _visible(page, sel, PROBE_TIMEOUT) for name, sel in S.REQUIRED.items()}
 
     async def stop(self) -> None:
         """Cancel an in-flight generation."""
@@ -69,6 +100,24 @@ class ChatGPTAdapter:
 
     async def ask(self, prompt: str, timeout: int, new_chat: bool = True) -> str:
         deadline = time.monotonic() + timeout
+        for attempt in (1, 2):
+            try:
+                # attempt 2 forces a fresh temporary chat: that IS the reload, and
+                # it stops a half-landed prompt being submitted twice in one thread.
+                return await self._ask_once(prompt, deadline, new_chat or attempt == 2)
+            except BridgeError as exc:
+                await self._shot(f"{exc.code}-try{attempt}")
+                if attempt == 2 or exc.code not in RETRY_ON or time.monotonic() >= deadline:
+                    raise
+                log.warning("adapter.retrying code=%s", exc.code)
+
+    async def _shot(self, tag: str) -> None:
+        try:
+            await _write_shot(await self.browser.page(), tag)
+        except BridgeError:
+            pass            # no browser, no screenshot; the error itself still stands
+
+    async def _ask_once(self, prompt: str, deadline: float, new_chat: bool) -> str:
         page = await self.browser.page()
 
         # a stray tab (an OAuth redirect, say) must not be treated as a chat
@@ -112,6 +161,7 @@ class ChatGPTAdapter:
                 text, source = parsed, "stream"
                 break
 
+        self.last_source = source
         log.info("adapter.generation_complete stream_ms=%d chars=%d source=%s",
                  (time.monotonic() - t1) * 1000, len(text), source)
         return text
@@ -177,6 +227,12 @@ class ChatGPTAdapter:
             await page.keyboard.insert_text(prompt)
             await page.locator(S.SEND_BUTTON).first.click(timeout=10000)
         except PWError as exc:
+            # A throttle modal overlays the composer and swallows the click. Blaming
+            # the composer sends the caller off to fix selectors that are fine -- and
+            # PROMPT_SUBMIT_FAILED is retried, which hammers the service that just
+            # asked us to slow down. Ask the page what actually happened.
+            if await _visible(page, S.RATE_LIMIT_MARKER):
+                raise BridgeError("CHATGPT_RATE_LIMITED") from exc
             raise BridgeError("PROMPT_SUBMIT_FAILED", str(exc).splitlines()[0]) from exc
 
     async def _wait_started(self, page: Page, before: int, deadline: float) -> None:
